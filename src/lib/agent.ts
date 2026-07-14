@@ -1,5 +1,5 @@
 import * as li from "./linkedin";
-import { getStatus, getLastPosts } from "./session";
+import { probeStatus, getLastPosts } from "./session";
 import { beginRun, cancelled } from "./cancel";
 import * as safety from "./safety";
 
@@ -766,7 +766,10 @@ export async function* runAgent(
     yield { type: "error", content: "No API key found — set GEMINI_API_KEY or GROQ_API_KEY in .env.local" };
     return;
   }
-  const { status } = getStatus();
+  // MUST be the same check the status endpoint uses. getStatus() reads in-memory
+  // state, which on serverless is empty on every request — so the agent always
+  // believed it was disconnected even while the header said "connected".
+  const { status } = await probeStatus();
   beginRun(); // clears any leftover cancel from the previous command
 
   const messages: ChatMessage[] = [
