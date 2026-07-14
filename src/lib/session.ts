@@ -1,5 +1,6 @@
 import { chromium, BrowserContext, Page } from "playwright-core";
 import path from "path";
+import fs from "fs/promises";
 import { cookies } from "next/headers";
 import * as bb from "./browserbase";
 import * as sl from "./serverless-browser";
@@ -151,14 +152,7 @@ async function localPage(): Promise<Page> {
   const s = state();
   if (s.context && s.page && !s.page.isClosed()) return s.page;
 
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: false,
-    channel: "chromium",
-    viewport: { width: 1280, height: 850 },
-    args: ["--disable-blink-features=AutomationControlled"],
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-  });
+  const context = await launchLocal();
   const page = context.pages()[0] ?? (await context.newPage());
   context.on("close", () => {
     const st = state();
@@ -169,6 +163,45 @@ async function localPage(): Promise<Page> {
   s.context = context;
   s.page = page;
   return page;
+}
+
+/**
+ * Chromium refuses to start if another process still holds the profile
+ * directory ("Opening in existing browser session") — which happens whenever a
+ * previous run left a Chrome behind, or two dev servers are running at once.
+ * That used to surface as "nothing happens when I click Connect", so instead of
+ * failing we clear the stale lock files and retry once.
+ */
+async function launchLocal(): Promise<BrowserContext> {
+  try {
+    return await launchWithProfile();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/existing browser session|ProcessSingleton|already in use/i.test(msg)) throw e;
+
+    for (const f of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+      await fs.rm(path.join(PROFILE_DIR, f), { force: true }).catch(() => {});
+    }
+    await new Promise((r) => setTimeout(r, 800));
+    try {
+      return await launchWithProfile();
+    } catch {
+      throw new Error(
+        "A previous Chrome is still holding the LinkedIn profile. Close any Chrome window Jarvis opened (and make sure only one dev server is running), then hit Connect again."
+      );
+    }
+  }
+}
+
+function launchWithProfile(): Promise<BrowserContext> {
+  return chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: false,
+    channel: "chromium",
+    viewport: { width: 1280, height: 850 },
+    args: ["--disable-blink-features=AutomationControlled"],
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  });
 }
 
 export async function getPage(): Promise<Page> {
@@ -206,6 +239,7 @@ export async function probeStatus(): Promise<{
   error: string | null;
   liveViewUrl?: string | null;
   remote: boolean;
+  cloud?: boolean;
 }> {
   if (SERVERLESS) {
     // Cheap: just check whether we're holding a LinkedIn auth cookie. Launching
@@ -214,6 +248,7 @@ export async function probeStatus(): Promise<{
       status: (await sl.hasSession()) ? "connected" : "disconnected",
       error: null,
       remote: false,
+      cloud: true, // no window will ever open — the UI must say so
     };
   }
   if (REMOTE) {

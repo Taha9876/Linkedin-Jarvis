@@ -117,6 +117,7 @@ export default function Home() {
   // Cloud mode: the browser runs in Browserbase, so we embed its live view —
   // that's how the user solves CAPTCHAs and watches Jarvis work when deployed.
   const [safety, setSafety] = useState<SafetyUsage | null>(null);
+  const [cloud, setCloud] = useState(false); // deployed serverless: no visible browser
   const [remote, setRemote] = useState(false);
   const [liveView, setLiveView] = useState<string | null>(null);
   const [showLiveView, setShowLiveView] = useState(false);
@@ -179,6 +180,12 @@ export default function Home() {
       setConnError(j.error ?? null);
       setRemote(!!j.remote);
       setLiveView(j.liveViewUrl ?? null);
+      if (j.cloud) {
+        setCloud(true);
+        // No window can ever open in the cloud, and a password login dead-ends
+        // on LinkedIn's CAPTCHA. Put people straight onto the flow that works.
+        setUseCookie(true);
+      }
     } catch {
       setConn("unknown");
     }
@@ -611,8 +618,18 @@ export default function Home() {
           <div className="fade-in w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900/60 p-8 shadow-2xl backdrop-blur light:border-zinc-200 light:bg-white/80">
             <h2 className="text-lg font-semibold text-white light:text-zinc-900">Connect your LinkedIn</h2>
             <p className="mt-1 text-[13px] leading-relaxed text-zinc-500 light:text-zinc-600">
-              A real Chrome window opens and signs in. Your credentials go only to LinkedIn — the
-              session is saved locally, so next time you won&apos;t need them at all.
+              {cloud ? (
+                <>
+                  This is the cloud version, so <strong>no browser window opens on your screen</strong> —
+                  Chrome runs headless on the server. Sign in by pasting your LinkedIn session cookie:
+                  a password login would just hit a CAPTCHA that you&apos;d have no window to solve.
+                </>
+              ) : (
+                <>
+                  A real Chrome window opens and signs in. Your credentials go only to LinkedIn — the
+                  session is saved locally, so next time you won&apos;t need them at all.
+                </>
+              )}
             </p>
             <div className="mt-6 space-y-3">
               {useCookie ? (
@@ -624,11 +641,28 @@ export default function Home() {
                     rows={3}
                     className="w-full resize-none rounded-xl border border-zinc-700 bg-zinc-950/70 px-4 py-3 font-mono text-[11px] text-white placeholder-zinc-600 outline-none transition focus:border-indigo-500 light:border-zinc-300 light:bg-white light:text-zinc-900 light:placeholder-zinc-400"
                   />
-                  <p className="text-[11px] leading-relaxed text-zinc-500 light:text-zinc-500">
-                    In a browser where you&apos;re already on LinkedIn: DevTools → Application →
-                    Cookies → <code>linkedin.com</code> → copy the value of <code>li_at</code>. Your
-                    password never leaves your machine, and no CAPTCHA is involved.
-                  </p>
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 text-[11px] leading-relaxed text-zinc-400 light:border-zinc-200 light:bg-zinc-50 light:text-zinc-600">
+                    <p className="mb-1 font-medium text-zinc-300 light:text-zinc-800">
+                      Where to find it:
+                    </p>
+                    <ol className="list-inside list-decimal space-y-0.5">
+                      <li>
+                        Open <strong>www.linkedin.com</strong> in another tab (logged in) —{" "}
+                        <span className="text-amber-400">not this page</span>
+                      </li>
+                      <li>Press F12 → <strong>Application</strong> tab</li>
+                      <li>
+                        Cookies → <strong>https://www.linkedin.com</strong>
+                      </li>
+                      <li>
+                        Find <code className="text-indigo-400">li_at</code> → copy its{" "}
+                        <strong>Value</strong> (a long string)
+                      </li>
+                    </ol>
+                    <p className="mt-1.5 text-zinc-500">
+                      Your password never leaves your machine, and no CAPTCHA is involved.
+                    </p>
+                  </div>
                 </>
               ) : (
                 <>
@@ -649,24 +683,35 @@ export default function Home() {
                   />
                 </>
               )}
-              <button
-                onClick={() => setUseCookie((v) => !v)}
-                className="w-full text-center text-[11px] text-indigo-400 hover:text-indigo-300"
-              >
-                {useCookie
-                  ? "← Use email and password instead"
-                  : "Deployed to the cloud? Sign in with your li_at cookie instead →"}
-              </button>
+              {/* In the cloud, email+password genuinely cannot work — don't offer it. */}
+              {!cloud && (
+                <button
+                  onClick={() => setUseCookie((v) => !v)}
+                  className="w-full text-center text-[11px] text-indigo-400 hover:text-indigo-300"
+                >
+                  {useCookie
+                    ? "← Use email and password instead"
+                    : "Deployed to the cloud? Sign in with your li_at cookie instead →"}
+                </button>
+              )}
               <button
                 onClick={handleConnect}
                 disabled={conn === "connecting"}
                 className="w-full rounded-xl bg-gradient-to-r from-indigo-500 to-fuchsia-500 py-3 text-sm font-semibold text-white shadow-lg shadow-indigo-500/25 transition hover:brightness-110 disabled:opacity-50"
               >
-                {conn === "connecting" ? "Opening Chrome & signing in…" : "Connect & launch"}
+                {conn === "connecting"
+                  ? cloud
+                    ? "Signing in…"
+                    : "Opening Chrome & signing in…"
+                  : cloud
+                    ? "Connect"
+                    : "Connect & launch"}
               </button>
               {connError && <p className="text-[12px] text-rose-400">{connError}</p>}
               <p className="pt-1 text-center text-[11px] text-zinc-600 light:text-zinc-500">
-                Signed in before? Leave the fields empty and hit Connect.
+                {cloud
+                  ? "The cookie is stored only in your own browser session."
+                  : "Signed in before? Leave the fields empty and hit Connect."}
               </p>
             </div>
           </div>
