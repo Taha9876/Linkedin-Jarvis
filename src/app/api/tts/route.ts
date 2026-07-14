@@ -7,11 +7,29 @@ export const maxDuration = 60;
  * Text-to-speech: Gemini TTS first (free tier), then Groq PlayAI, and if
  * neither works we return 422 so the client falls back to browser speech.
  */
+/**
+ * Once a neural provider fails (quota exhausted, terms not accepted), it will
+ * keep failing. Remember that and answer 422 instantly instead of burning a
+ * 1-2s round trip per sentence — that latency was the whole reason speech
+ * started late. Re-probe occasionally in case quota resets.
+ */
+const g = globalThis as unknown as { __ttsDeadUntil?: number };
+const DEAD_FOR_MS = 10 * 60 * 1000;
+
+function neuralDead(): boolean {
+  return !!g.__ttsDeadUntil && Date.now() < g.__ttsDeadUntil;
+}
+function markNeuralDead() {
+  g.__ttsDeadUntil = Date.now() + DEAD_FOR_MS;
+}
+
 export async function POST(req: NextRequest) {
   const { text } = await req.json().catch(() => ({}));
   if (!text || typeof text !== "string") {
     return new Response("text required", { status: 400 });
   }
+  if (neuralDead()) return new Response("tts unavailable", { status: 422 });
+
   const input = text.slice(0, 900);
 
   const gemini = await geminiTts(input);
@@ -20,7 +38,13 @@ export async function POST(req: NextRequest) {
   const groq = await groqTts(input);
   if (groq) return groq;
 
+  markNeuralDead();
   return new Response("tts unavailable", { status: 422 });
+}
+
+/** Cheap check the client makes once on load to pick its voice path. */
+export async function GET() {
+  return Response.json({ neural: !neuralDead() });
 }
 
 /** Gemini TTS is multilingual — nudge the delivery when the text is Urdu. */

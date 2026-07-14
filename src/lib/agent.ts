@@ -1,6 +1,7 @@
 import * as li from "./linkedin";
 import { getStatus, getLastPosts } from "./session";
 import { beginRun, cancelled } from "./cancel";
+import * as safety from "./safety";
 
 /* ------------------------------------------------------------------ */
 /* Tool schemas (OpenAI/Groq function-calling format)                  */
@@ -423,21 +424,27 @@ function requiresConfirmation(name: string, args: Record<string, unknown>): bool
   return DESTRUCTIVE.has(name) && args.confirmed !== true;
 }
 
-// LinkedIn flags bursts of write actions. Space them out like a human would.
-const WRITE_TOOLS = new Set([
-  "like_post",
-  "unlike_post",
-  "comment_on_post",
-  "create_post",
-  "repost",
-  "delete_post",
-  "save_post",
-  "follow_person",
-  "connect_with_person",
-  "send_message",
-]);
-let lastWriteAt = 0;
-const MIN_WRITE_GAP_MS = 4000;
+/**
+ * Which tools count as "writes" LinkedIn tracks, and under which budget. Reads
+ * (scroll, read, summarize, search, open profile) are unbudgeted — LinkedIn does
+ * not punish reading, and pretending otherwise would just make Jarvis useless.
+ */
+const WRITE_KIND: Record<string, safety.ActionKind> = {
+  like_post: "like",
+  unlike_post: "like",
+  save_post: "like", // same lightweight class of interaction
+  comment_on_post: "comment",
+  delete_comment: "comment",
+  create_post: "post",
+  delete_post: "post",
+  repost: "repost",
+  follow_person: "follow",
+  unfollow_person: "follow",
+  connect_with_person: "connect",
+  send_message: "message",
+  edit_message: "message",
+  delete_message: "message",
+};
 
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<string> {
   await li.guardSession(); // surfaces CAPTCHAs / sign-outs instead of failing silently
@@ -450,7 +457,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       );
     }
     const which = String(args.target ?? "");
-    const posts = getLastPosts();
+    const posts = await getLastPosts();
     const idx = parseInt(which, 10);
     const entry = Number.isFinite(idx) ? posts[idx - 1] : posts.find((p) => p.author.toLowerCase().includes(which.toLowerCase()));
     const desc = entry
@@ -463,14 +470,21 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     );
   }
 
-  if (WRITE_TOOLS.has(name)) {
-    const since = Date.now() - lastWriteAt;
-    if (since < MIN_WRITE_GAP_MS) {
-      await new Promise((r) => setTimeout(r, MIN_WRITE_GAP_MS - since));
-    }
-    lastWriteAt = Date.now();
-  }
+  // Account safety: budget + pace every write. Throws a SafetyError (which the
+  // agent reads aloud) when a limit is hit, rather than plowing on.
+  const kind = WRITE_KIND[name];
+  if (kind) await safety.guardWrite(kind);
+  else safety.noteRead();
 
+  const result = await dispatch(name, args);
+
+  // Only a write that actually SUCCEEDED counts against the budget — a failed
+  // click shouldn't cost the user part of their daily allowance.
+  if (kind) safety.recordWrite(kind);
+  return result;
+}
+
+async function dispatch(name: string, args: Record<string, unknown>): Promise<string> {
   const num = (v: unknown): number | string => {
     const s = String(v ?? "").trim();
     const n = parseInt(s, 10);
@@ -572,21 +586,21 @@ function getProviders(): Provider[] {
   const groq = process.env.GROQ_API_KEY;
   const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
-  if (gemini) {
-    // flash-lite first: lowest latency and the most generous free quota, which
-    // matters for a voice agent firing several calls per spoken command.
-    list.push({ url: GEMINI_URL, key: gemini, model: "gemini-flash-lite-latest", name: "Gemini Flash-Lite" });
-    list.push({ url: GEMINI_URL, key: gemini, model: "gemini-flash-latest", name: "Gemini Flash" });
-  }
+  // Groq FIRST: measured ~0.8s vs Gemini's ~1.6s on the same prompt. For a voice
+  // agent that fires several model calls per spoken command, that gap compounds
+  // into the difference between snappy and sluggish. gpt-oss-120b also handles
+  // this many tool definitions reliably (llama-3.3 returns tool_use_failed).
   if (groq) {
     list.push({
       url: "https://api.groq.com/openai/v1/chat/completions",
       key: groq,
-      // gpt-oss-120b handles this many tool definitions far more reliably than
-      // llama-3.3, which returns tool_use_failed on a large tool set.
       model: "openai/gpt-oss-120b",
       name: "Groq",
     });
+  }
+  if (gemini) {
+    list.push({ url: GEMINI_URL, key: gemini, model: "gemini-flash-lite-latest", name: "Gemini Flash-Lite" });
+    list.push({ url: GEMINI_URL, key: gemini, model: "gemini-flash-latest", name: "Gemini Flash" });
   }
   return list;
 }
@@ -618,12 +632,16 @@ async function chat(providers: Provider[], body: object): Promise<{ msg: ChatMes
       lastError = `${p.name} error ${res.status}: ${text.slice(0, 200)}`;
       // 429/5xx = overloaded or out of quota; tool_use_failed = this model
       // botched the function call. Both are worth another model's attempt.
+      // Anything recoverable → switch model IMMEDIATELY. Sleeping and retrying
+      // the same overloaded model just adds seconds to a voice reply; another
+      // provider is almost always faster than waiting for this one.
       const retryable =
         res.status === 429 || res.status >= 500 || text.includes("tool_use_failed");
       if (!retryable) break;
-      // quota exhaustion won't clear on a retry — move straight to the next model
-      if (text.includes("exceeded your current quota") || text.includes("tool_use_failed")) break;
-      if (attempt === 0) await new Promise((r) => setTimeout(r, 700));
+      if (res.status === 429 || text.includes("exceeded your current quota") || text.includes("tool_use_failed")) {
+        break; // no backoff — go straight to the next provider
+      }
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
     }
   }
   return { error: lastError };
@@ -665,17 +683,53 @@ The SAME intent has endless phrasings. Voice transcripts are messy — typos, no
 - go_back: "go back", "previous page", "take me back"
 
 Operating rules:
-- Before acting on "that post" or "the second post", call read_visible_posts so post numbers are fresh. Numbers run top of screen downwards.
-- "this post", "it", "that" = post number 1 (the one most in view).
+- BE FAST. Take the shortest path. Do NOT call read_visible_posts before acting — like_post, comment_on_post, save_post etc. already read the screen themselves. Only call read_visible_posts when the user actually wants the posts read out, or when you need the content to write a comment or summary.
+- "this post", "it", "that" = post number 1 (the one most in view). Numbers run top of screen downwards.
 - Ambiguous? Pick the most reasonable interpretation and do it — then say what you did. Don't interrogate the user.
 - Comments and posts: use the user's exact words if they dictated them. Otherwise write something short, human and specific to the post — never generic spam like "Great post!".
 - Only post, message, or send connection requests when clearly asked. If the wording wasn't given, say your proposed text aloud and wait for a go-ahead.
 - DELETING IS PERMANENT AND ALWAYS TWO STEPS. Your first delete_post / delete_comment call is automatically refused and hands you the post's text — read that text back and ask "shall I delete it?". Only when the user clearly says yes, call again with confirmed=true. If they hesitate or change the subject, don't delete.
 - If a tool fails, say plainly what happened and what to try next.
 - On a security checkpoint or CAPTCHA, stop everything and tell the user to solve it in the Chrome window.
-- No mass actions. If asked to like everything, do at most 3 and say so.
+ACCOUNT SAFETY — this protects the user from being restricted or banned:
+- There are hard daily and hourly limits on likes, comments, connects, follows, messages and posts. If a tool refuses with a safety limit, DO NOT retry it, do not try a different tool to achieve the same thing, and do not argue. Tell the user plainly what the limit was and that you stopped to protect their account.
+- NEVER mass-act. If asked to "like everything", "connect with everyone", "comment on all of these" — refuse the bulk framing, do at most 2-3, and say you're keeping it human-paced on purpose.
+- Actions are deliberately spaced out. If the user asks why you're slow on writes, explain it's pacing that keeps their account safe.
+- Never write the same comment twice, and never send identical messages to multiple people — repetition is the clearest automation signal there is.
 
 The user watches the browser window on their screen, so narrate lightly, not exhaustively.`;
+
+/**
+ * Tools whose result is ALREADY a good spoken sentence ("Liked Sarah's post.").
+ *
+ * For these we skip the second model call entirely and speak the tool's own
+ * output. That call existed only to have the model rephrase a sentence we
+ * already had — it doubled the latency of every simple command for nothing.
+ *
+ * Anything needing judgement (reading posts aloud, summarising, search results)
+ * still goes back to the model, because those results are raw data, not speech.
+ */
+const SPEAKABLE = new Set([
+  "scroll",
+  "like_post",
+  "unlike_post",
+  "save_post",
+  "comment_on_post",
+  "create_post",
+  "repost",
+  "delete_post",
+  "delete_comment",
+  "follow_person",
+  "unfollow_person",
+  "connect_with_person",
+  "send_message",
+  "edit_message",
+  "delete_message",
+  "go_home",
+  "go_back",
+  "click_element",
+  "view_profile_photo",
+]);
 
 export interface AgentEvent {
   type: "tool_call" | "tool_result" | "tool_error" | "assistant" | "error";
@@ -693,6 +747,15 @@ interface ChatMessage {
     function: { name: string; arguments: string };
   }[];
   tool_call_id?: string;
+}
+
+/** Urdu script, or the Roman-Urdu verbs that show up in spoken commands. */
+function userSpeaksUrdu(history: { role: string; content: string }[]): boolean {
+  const last = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
+  if (/[؀-ۿݐ-ݿ]/.test(last)) return true;
+  return /\b(karo|kardo|kar do|bhejo|dikhao|ruko|rok do|neeche|upar|aahista|ahista|mera|meri|mujhe|kya|nahi|acha|theek)\b/i.test(
+    last
+  );
 }
 
 export async function* runAgent(
@@ -736,8 +799,8 @@ export async function* runAgent(
       messages,
       tools: TOOLS,
       tool_choice: "auto",
-      temperature: 0.6,
-      max_tokens: 1024,
+      temperature: 0.4, // less dithering = fewer wasted tool hops
+      max_tokens: 400, // replies are one or two spoken sentences
     });
 
     if ("error" in result) {
@@ -752,6 +815,10 @@ export async function* runAgent(
         content: msg.content ?? null,
         tool_calls: msg.tool_calls,
       });
+      const spoken: string[] = [];
+      let allSpeakable = true;
+      let anyFailed = false;
+
       for (const tc of msg.tool_calls) {
         let args: Record<string, unknown> = {};
         try {
@@ -764,12 +831,30 @@ export async function* runAgent(
           const result = await executeTool(tc.function.name, args);
           yield { type: "tool_result", name: tc.function.name, content: result };
           messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+          if (SPEAKABLE.has(tc.function.name)) spoken.push(result);
+          else allSpeakable = false;
         } catch (e) {
           const errText = e instanceof Error ? e.message : String(e);
           yield { type: "tool_error", name: tc.function.name, content: errText };
           messages.push({ role: "tool", tool_call_id: tc.id, content: `ERROR: ${errText}` });
+          anyFailed = true;
+          allSpeakable = false;
         }
       }
+
+      // FAST PATH: the tools already produced a sentence fit to speak, so skip
+      // the extra model round trip that would only rephrase it. Halves the
+      // latency of "like it", "scroll down", "save that" and friends.
+      // (Not taken if anything failed or needs interpretation — those need the
+      // model to explain, summarise, or decide what to do next.)
+      // Tool results are written in English, so the shortcut is only safe when
+      // the user is speaking English. Urdu goes back to the model to be answered
+      // in Urdu — correctness beats the saved second.
+      if (allSpeakable && !anyFailed && spoken.length && !cancelled() && !userSpeaksUrdu(history)) {
+        yield { type: "assistant", content: spoken.join(" ") };
+        return;
+      }
+
       continue; // let the model see tool results and respond
     }
 

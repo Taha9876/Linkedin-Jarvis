@@ -1,4 +1,4 @@
-import { Page } from "playwright";
+import { Page } from "playwright-core";
 import { getPage, getLastPosts, setLastPosts } from "./session";
 import { cancelled, interruptibleSleep } from "./cancel";
 
@@ -171,7 +171,7 @@ export async function search(
   if (kind === "posts") {
     const posts = await readVisiblePostsInternal(page);
     if (posts.length) {
-      setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+      await setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
       return formatPosts(posts, `Post results for "${query}"`);
     }
   }
@@ -277,8 +277,8 @@ export async function scroll(
 
   const plan = {
     slow: { steps: Math.min(Math.max(amount, 1), 30) * 6, px: 90, gap: 220 },
-    normal: { steps: Math.min(Math.max(amount, 1), 10), px: 700, gap: 300 },
-    fast: { steps: Math.min(Math.max(amount, 1), 10), px: 1400, gap: 120 },
+    normal: { steps: Math.min(Math.max(amount, 1), 10), px: 700, gap: 120 },
+    fast: { steps: Math.min(Math.max(amount, 1), 10), px: 1400, gap: 60 },
   }[speed];
 
   let done = 0;
@@ -403,7 +403,7 @@ async function readVisiblePostsInternal(page: Page): Promise<VisiblePost[]> {
 export async function readVisiblePosts(): Promise<string> {
   const page = await getPage();
   const posts = await readVisiblePostsInternal(page);
-  setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+  await setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
   return formatPosts(posts, "Posts on screen");
 }
 
@@ -412,12 +412,19 @@ export async function readVisiblePosts(): Promise<string> {
 /* ------------------------------------------------------------------ */
 
 async function locatePost(page: Page, target: number | string) {
-  let posts = getLastPosts();
-  if (!posts.length) {
-    // be forgiving: read the screen automatically instead of failing
+  let posts = await getLastPosts();
+
+  // Verify our cached post handles still exist on the page — the feed
+  // reshuffles constantly. If they're stale (or we never read), re-read now.
+  // This is what lets the agent skip a whole read_visible_posts round trip.
+  const stale =
+    !posts.length ||
+    (await page.locator(`[data-jarvis-post="${posts[0].urn}"]`).count().catch(() => 0)) === 0;
+
+  if (stale) {
     const fresh = await readVisiblePostsInternal(page);
-    setLastPosts(fresh.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
-    posts = getLastPosts();
+    await setLastPosts(fresh.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+    posts = await getLastPosts();
     if (!posts.length) throw new Error("No posts on screen. Go to the feed and scroll a bit first.");
   }
   let entry;
@@ -727,7 +734,7 @@ export async function openMyActivity(
 
   if (kind === "posts") {
     const posts = await readVisiblePostsInternal(page);
-    setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+    await setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
     return formatPosts(posts, "Your recent posts");
   }
 
@@ -745,7 +752,7 @@ export async function openMyActivity(
 
   // let the agent act on these posts too ("delete my comment on that one")
   const posts = await readVisiblePostsInternal(page);
-  setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+  await setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
   return `Your recent ${kind}:\n` + items.map((t, i) => `${i + 1}. ${t}`).join("\n");
 }
 
@@ -757,7 +764,7 @@ export async function openSavedPosts(): Promise<string> {
   await humanPause(page, 900, 1400);
   const posts = await readVisiblePostsInternal(page);
   if (posts.length) {
-    setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+    await setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
     return formatPosts(posts, "Your saved posts");
   }
   const text = await page.evaluate(
@@ -774,7 +781,7 @@ export async function openMyRecentPosts(): Promise<string> {
   });
   await humanPause(page, 900, 1400);
   const posts = await readVisiblePostsInternal(page);
-  setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+  await setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
   return formatPosts(posts, "Your recent posts and activity");
 }
 
@@ -1246,7 +1253,7 @@ export async function describeScreen(): Promise<string> {
   const title = await page.title().catch(() => "");
   const posts = await readVisiblePostsInternal(page);
   if (posts.length) {
-    setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
+    await setLastPosts(posts.map((p) => ({ urn: p.id, author: p.author, text: p.text })));
     return `Current page: ${title} (${url})\n` + formatPosts(posts, "Posts on screen");
   }
   const text = await page

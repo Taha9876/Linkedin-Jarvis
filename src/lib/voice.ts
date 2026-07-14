@@ -89,7 +89,20 @@ function speakBrowser(sentence: string, signal: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Neural TTS is a network hop. If it's unavailable (quota gone, terms not
+ * accepted) we must NOT pay that hop per sentence and then fall back — that
+ * delay is exactly what made Jarvis start speaking late. One failure disables
+ * it for the session and we go straight to the instant browser voice.
+ */
+let neuralDead = false;
+
+export function neuralAvailable(): boolean {
+  return !neuralDead;
+}
+
 async function fetchTts(sentence: string, signal: AbortSignal): Promise<Blob | null> {
+  if (neuralDead) return null;
   try {
     const r = await fetch("/api/tts", {
       method: "POST",
@@ -97,6 +110,10 @@ async function fetchTts(sentence: string, signal: AbortSignal): Promise<Blob | n
       body: JSON.stringify({ text: sentence }),
       signal,
     });
+    if (r.status === 422) {
+      neuralDead = true; // don't try again this session
+      return null;
+    }
     if (!r.ok) return null;
     return await r.blob();
   } catch {
@@ -136,7 +153,7 @@ export function speak(text: string, useNeural: boolean): SpeakHandle {
 
   const done = (async () => {
     const sentences = splitSentences(text);
-    if (!useNeural) {
+    if (!useNeural || neuralDead) {
       for (const s of sentences) {
         if (signal.aborted) return;
         await speakBrowser(s, signal);
@@ -179,6 +196,23 @@ export function speak(text: string, useNeural: boolean): SpeakHandle {
 }
 
 /** Warm up the browser voice list (Chrome loads it lazily). */
+/**
+ * Chrome's FIRST utterance is always laggy — the engine boots on demand. Firing
+ * a silent one on the user's first gesture (the orb click) pays that cost up
+ * front, so the first real reply speaks immediately instead of hanging.
+ */
+export function warmUpSpeech() {
+  try {
+    const u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0;
+    const v = pickVoice(false);
+    if (v) u.voice = v;
+    window.speechSynthesis.speak(u);
+  } catch {
+    /* unsupported */
+  }
+}
+
 export function primeVoices() {
   try {
     window.speechSynthesis.getVoices();
@@ -186,4 +220,12 @@ export function primeVoices() {
   } catch {
     /* unsupported */
   }
+  // Ask up front whether neural TTS actually works, so the very first reply
+  // doesn't waste a round trip discovering that it doesn't.
+  fetch("/api/tts")
+    .then((r) => r.json())
+    .then((j) => {
+      if (j && j.neural === false) neuralDead = true;
+    })
+    .catch(() => {});
 }

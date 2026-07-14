@@ -12,6 +12,71 @@ npm run dev
 
 Open http://localhost:3000 in **Chrome or Edge** (voice input needs the Web Speech API).
 
+## Deploy to Vercel ☁️ (no browser service needed)
+
+Chromium is bundled **into the serverless function** via `@sparticuz/chromium`. No Browserbase, no
+VPS, no API key for the browser.
+
+The hard part isn't running Chromium — it's that a Vercel function is **stateless**: the browser is
+born and dies inside one request. So everything a long-lived browser normally holds is carried
+between requests in httpOnly cookies on your own domain:
+
+| what | where it lives |
+|---|---|
+| LinkedIn auth (`li_at`) | httpOnly cookie |
+| the page you were on | httpOnly cookie |
+| your scroll position | httpOnly cookie |
+| which posts are "#1, #2…" | httpOnly cookie |
+
+Each request: launch Chromium → restore cookies → return to your page and scroll offset → do the
+thing → save the new state → close.
+
+### Steps
+
+1. Push to GitHub, import on Vercel.
+2. Set env vars: `GROQ_API_KEY` (and optionally `GEMINI_API_KEY`).
+3. Open the deployed URL → **"Sign in with your li_at cookie"**.
+
+### Why the cookie, not a password?
+
+A serverless browser has **no window**, so if LinkedIn throws a CAPTCHA at login there is nowhere for
+you to solve it — and it will, because Vercel runs on datacenter IPs. Pasting an existing session
+cookie skips the login form entirely:
+
+> DevTools → Application → Cookies → `linkedin.com` → copy the value of **`li_at`**
+
+Your password never leaves your machine. (You can also set it as the `LINKEDIN_LI_AT` env var.)
+
+### Honest limits of this mode
+
+- **Slower.** Every command pays a Chromium cold start (~1-3s) on top of the action.
+- **No live tool progress.** Cookies can't be written once a response has started streaming, so the
+  turn is buffered and sent in one go.
+- **LinkedIn is harsher on datacenter IPs.** Expect more frequent security checks than at home. If
+  one appears, you'll need to clear it in a normal browser.
+- `li_at` expires (weeks, or on password change) — paste a fresh one when it does.
+
+Local mode remains the fastest, least-flagged way to run this.
+
+---
+
+## Alternative: cloud browser with a live view (Browserbase)
+
+If you want to *see* and interact with the cloud browser — solve CAPTCHAs in-page, watch Jarvis work
+— set `BROWSERBASE_API_KEY` + `BROWSERBASE_PROJECT_ID`. Vercel then reconnects over CDP to a
+persistent Chrome instead of bundling one, and an interactive live view is embedded in the dashboard.
+
+The three modes, chosen automatically by which env vars are set:
+
+| | Local (default) | Vercel, bundled Chromium | Vercel + Browserbase |
+|---|---|---|---|
+| Trigger | no cloud vars | deployed, no BB key | `BROWSERBASE_API_KEY` |
+| Browser | visible Chrome, your PC | headless, inside the function | persistent cloud Chrome |
+| Login | email + password | paste `li_at` cookie | password or cookie |
+| CAPTCHA | solve in the window | can't — use a fresh cookie | solve in **live view** |
+| Speed | fastest | +1-3s cold start / command | fast |
+| Your PC | must be on | can be off | can be off |
+
 ## First-time setup
 
 1. Enter your LinkedIn email + password → **Connect & launch**. A real Chrome window opens and signs in.
@@ -95,9 +160,20 @@ on quota exhaustion (429), overload (503), or a botched tool call:
 2. `gemini-flash-latest`
 3. Groq `openai/gpt-oss-120b` — handles this many tool definitions reliably (llama-3.3 does not)
 
-Voice is `gemini-2.5-flash-preview-tts` ("Aoede"), falling back to Groq PlayAI, then the browser voice.
+### Voice quality vs. speed
 
-Gemini's free tier is capped per day — when it runs out mid-session Jarvis keeps working via Groq.
+Voice tries `gemini-2.5-flash-preview-tts` ("Aoede"), then Groq PlayAI, then the browser's own voice.
+
+**If neural TTS is unavailable (quota gone / terms not accepted), Jarvis uses the instant browser
+voice and never retries it.** This matters: previously every sentence paid a ~1-2s round trip to a
+dead provider *before* falling back, which made speech start noticeably late. Now the app probes
+once on page load and, if neural is down, speaks immediately with zero network delay.
+
+**To get the natural female voice back**, do either:
+- accept the **PlayAI TTS terms** at console.groq.com (free, and fast — ~300ms), or
+- wait for the Gemini free-tier daily quota to reset, or use a Gemini key with quota.
+
+Neither is required — Jarvis works fully on the browser voice, just less human-sounding.
 
 ## Notes & warnings
 

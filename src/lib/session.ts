@@ -1,10 +1,13 @@
-import { chromium, BrowserContext, Page } from "playwright";
+import { chromium, BrowserContext, Page } from "playwright-core";
 import path from "path";
+import { cookies } from "next/headers";
+import * as bb from "./browserbase";
+import * as sl from "./serverless-browser";
 
 export type SessionStatus =
   | "disconnected"
   | "connecting"
-  | "checkpoint" // LinkedIn is asking for 2FA / verification in the visible window
+  | "checkpoint" // LinkedIn wants 2FA / CAPTCHA — user solves it in the window / live view
   | "connected"
   | "error";
 
@@ -13,68 +16,174 @@ interface SessionState {
   page: Page | null;
   status: SessionStatus;
   error: string | null;
-  // urn -> stable handle for posts the agent has "seen", so voice commands
-  // like "like the second post" resolve to a real DOM node
   lastPosts: { urn: string; author: string; text: string }[];
 }
 
-// Survive Next.js dev-server HMR: keep the browser on globalThis
-const g = globalThis as unknown as { __jarvisSession?: SessionState };
+/**
+ * Two very different runtimes:
+ *
+ *  LOCAL  — we launch a visible Chrome and keep it in module memory. The dev
+ *           server is one long-lived process, so that works.
+ *
+ *  REMOTE — on Vercel each request is a fresh, display-less sandbox with no
+ *           memory of the last one, so we cannot own a browser. Chrome lives in
+ *           Browserbase and we reconnect over CDP on every invocation. The
+ *           session id travels in a cookie; the login lives in a Browserbase
+ *           context. Post handles are re-read per request rather than cached.
+ */
+const REMOTE = bb.remoteEnabled();
+const SERVERLESS = sl.serverlessEnabled();
+
+const g = globalThis as unknown as {
+  __jarvisSession?: SessionState;
+  // In serverless mode a browser lives for exactly one request. It's opened on
+  // first use and torn down by finishRequest(), so every tool in a single
+  // command shares one browser instead of paying a cold start each.
+  __jarvisEphemeral?: sl.Ephemeral | null;
+};
+
+/** Serverless only: close the per-request browser and persist auth + position. */
+export async function finishRequest(): Promise<void> {
+  const e = g.__jarvisEphemeral;
+  g.__jarvisEphemeral = null;
+  if (e) await e.finish();
+}
 
 function state(): SessionState {
   if (!g.__jarvisSession) {
-    g.__jarvisSession = {
-      context: null,
-      page: null,
-      status: "disconnected",
-      error: null,
-      lastPosts: [],
-    };
+    g.__jarvisSession = { context: null, page: null, status: "disconnected", error: null, lastPosts: [] };
   }
   return g.__jarvisSession;
 }
 
 const PROFILE_DIR = path.join(process.cwd(), ".linkedin-profile");
+const SESSION_COOKIE = "jarvis_bb_session";
+const CONTEXT_COOKIE = "jarvis_bb_context";
+const POSTS_COOKIE = "jarvis_posts";
 
-export function getStatus(): { status: SessionStatus; error: string | null } {
-  const s = state();
-  return { status: s.status, error: s.error };
-}
+/* ------------------------------------------------------------------ */
+/* Post handles                                                        */
+/* ------------------------------------------------------------------ */
 
-/**
- * Look at the live browser window and update the status from what's actually
- * on screen. This is what lets a manual login (user types credentials or
- * solves a checkpoint directly in Chrome) get picked up automatically.
- */
-export async function probeStatus(): Promise<{ status: SessionStatus; error: string | null }> {
-  const s = state();
-  if (s.page && !s.page.isClosed()) {
-    try {
-      const url = s.page.url();
-      if (isCheckpointUrl(url)) {
-        // can happen mid-session (CAPTCHA) — must override a "connected" status
-        s.status = "checkpoint";
-        s.error = "LinkedIn wants a security check. Solve it in the Chrome window.";
-      } else if (isLoggedInUrl(url)) {
-        s.status = "connected";
-        s.error = null;
-      }
-    } catch {
-      /* page busy navigating — keep last known status */
-    }
+export async function getLastPosts() {
+  if (!REMOTE && !SERVERLESS) return state().lastPosts;
+  try {
+    const raw = (await cookies()).get(POSTS_COOKIE)?.value;
+    return raw ? (JSON.parse(decodeURIComponent(raw)) as SessionState["lastPosts"]) : [];
+  } catch {
+    return [];
   }
-  return { status: s.status, error: s.error };
 }
 
-export function getLastPosts() {
-  return state().lastPosts;
+export async function setLastPosts(posts: { urn: string; author: string; text: string }[]) {
+  if (!REMOTE && !SERVERLESS) {
+    state().lastPosts = posts;
+    return;
+  }
+  try {
+    // keep it small — cookies cap at ~4KB
+    const slim = posts.slice(0, 10).map((p) => ({ ...p, text: p.text.slice(0, 80) }));
+    (await cookies()).set(POSTS_COOKIE, encodeURIComponent(JSON.stringify(slim)), {
+      httpOnly: true,
+      sameSite: "lax",
+      maxAge: 3600,
+    });
+  } catch {
+    /* called outside a request scope — ignore */
+  }
 }
 
-export function setLastPosts(posts: { urn: string; author: string; text: string }[]) {
-  state().lastPosts = posts;
+/* ------------------------------------------------------------------ */
+/* Connecting                                                          */
+/* ------------------------------------------------------------------ */
+
+function isLoggedInUrl(url: string) {
+  return /linkedin\.com\/(feed|in\/|mynetwork|notifications|messaging|search|my-items)/.test(url);
+}
+function isCheckpointUrl(url: string) {
+  return /checkpoint|challenge|captcha|verify/i.test(url);
+}
+
+async function readCookie(name: string): Promise<string | undefined> {
+  try {
+    return (await cookies()).get(name)?.value;
+  } catch {
+    return undefined;
+  }
+}
+async function writeCookie(name: string, value: string) {
+  try {
+    (await cookies()).set(name, value, { httpOnly: true, sameSite: "lax", maxAge: 60 * 60 * 24 * 7 });
+  } catch {
+    /* not in a request scope */
+  }
+}
+
+/** Reattach to (or create) the cloud browser and hand back its page. */
+async function remotePage(create: boolean): Promise<Page | null> {
+  let sessionId = await readCookie(SESSION_COOKIE);
+  let contextId = await readCookie(CONTEXT_COOKIE);
+
+  if (sessionId) {
+    const live = await bb.getSession(sessionId);
+    if (!live || live.status !== "RUNNING") sessionId = undefined; // it was recycled
+  }
+
+  if (!sessionId) {
+    if (!create) return null;
+    contextId = await bb.ensureContext(contextId);
+    const s = await bb.createSession(contextId);
+    sessionId = s.id;
+    await writeCookie(SESSION_COOKIE, s.id);
+    await writeCookie(CONTEXT_COOKIE, contextId);
+  }
+
+  const info = await bb.getSession(sessionId);
+  if (!info?.connectUrl) throw new Error("Couldn't reach the cloud browser session.");
+
+  const browser = await chromium.connectOverCDP(info.connectUrl);
+  const ctx = browser.contexts()[0] ?? (await browser.newContext());
+  const page = ctx.pages()[0] ?? (await ctx.newPage());
+  return page;
+}
+
+async function localPage(): Promise<Page> {
+  const s = state();
+  if (s.context && s.page && !s.page.isClosed()) return s.page;
+
+  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: false,
+    channel: "chromium",
+    viewport: { width: 1280, height: 850 },
+    args: ["--disable-blink-features=AutomationControlled"],
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  });
+  const page = context.pages()[0] ?? (await context.newPage());
+  context.on("close", () => {
+    const st = state();
+    st.context = null;
+    st.page = null;
+    st.status = "disconnected";
+  });
+  s.context = context;
+  s.page = page;
+  return page;
 }
 
 export async function getPage(): Promise<Page> {
+  if (SERVERLESS) {
+    if (!(await sl.hasSession())) {
+      throw new Error("LinkedIn is not connected. Connect your account first.");
+    }
+    if (!g.__jarvisEphemeral) g.__jarvisEphemeral = await sl.openEphemeral();
+    return g.__jarvisEphemeral.page;
+  }
+  if (REMOTE) {
+    const page = await remotePage(false);
+    if (!page) throw new Error("LinkedIn is not connected. Connect your account first.");
+    return page;
+  }
   const s = state();
   if (!s.page || s.page.isClosed()) {
     throw new Error("LinkedIn is not connected. Connect your account first.");
@@ -82,106 +191,222 @@ export async function getPage(): Promise<Page> {
   return s.page;
 }
 
-async function ensureBrowser(): Promise<Page> {
+/* ------------------------------------------------------------------ */
+/* Status                                                              */
+/* ------------------------------------------------------------------ */
+
+export function getStatus(): { status: SessionStatus; error: string | null } {
   const s = state();
-  if (s.context && s.page && !s.page.isClosed()) return s.page;
-
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: false,
-    viewport: { width: 1280, height: 850 },
-    args: ["--disable-blink-features=AutomationControlled"],
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-  });
-  const page = context.pages()[0] ?? (await context.newPage());
-
-  context.on("close", () => {
-    const st = state();
-    st.context = null;
-    st.page = null;
-    st.status = "disconnected";
-  });
-
-  s.context = context;
-  s.page = page;
-  return page;
+  return { status: s.status, error: s.error };
 }
 
-function isLoggedInUrl(url: string) {
-  return (
-    url.includes("linkedin.com/feed") ||
-    url.includes("linkedin.com/in/") ||
-    url.includes("linkedin.com/mynetwork") ||
-    url.includes("linkedin.com/notifications") ||
-    url.includes("linkedin.com/messaging") ||
-    url.includes("linkedin.com/search")
-  );
+/** Look at the live browser and report what's actually on screen. */
+export async function probeStatus(): Promise<{
+  status: SessionStatus;
+  error: string | null;
+  liveViewUrl?: string | null;
+  remote: boolean;
+}> {
+  if (SERVERLESS) {
+    // Cheap: just check whether we're holding a LinkedIn auth cookie. Launching
+    // a browser merely to answer a 3-second poll would be absurd.
+    return {
+      status: (await sl.hasSession()) ? "connected" : "disconnected",
+      error: null,
+      remote: false,
+    };
+  }
+  if (REMOTE) {
+    const sessionId = await readCookie(SESSION_COOKIE);
+    if (!sessionId) return { status: "disconnected", error: null, remote: true };
+    try {
+      const page = await remotePage(false);
+      if (!page) return { status: "disconnected", error: null, remote: true };
+      const url = page.url();
+      if (isCheckpointUrl(url)) {
+        return {
+          status: "checkpoint",
+          error: "LinkedIn wants a security check — solve it in the live view below.",
+          liveViewUrl: await bb.liveViewUrl(sessionId),
+          remote: true,
+        };
+      }
+      if (isLoggedInUrl(url)) return { status: "connected", error: null, remote: true };
+      return {
+        status: "connecting",
+        error: null,
+        liveViewUrl: await bb.liveViewUrl(sessionId),
+        remote: true,
+      };
+    } catch (e) {
+      return { status: "error", error: e instanceof Error ? e.message : String(e), remote: true };
+    }
+  }
+
+  const s = state();
+  if (s.page && !s.page.isClosed()) {
+    try {
+      const url = s.page.url();
+      if (isCheckpointUrl(url)) {
+        s.status = "checkpoint";
+        s.error = "LinkedIn wants a security check. Solve it in the Chrome window.";
+      } else if (isLoggedInUrl(url)) {
+        s.status = "connected";
+        s.error = null;
+      }
+    } catch {
+      /* mid-navigation */
+    }
+  }
+  return { status: s.status, error: s.error, remote: false };
 }
 
-function isCheckpointUrl(url: string) {
-  return /checkpoint|challenge|captcha|verify/i.test(url);
+/* ------------------------------------------------------------------ */
+/* Connect / disconnect                                                */
+/* ------------------------------------------------------------------ */
+
+export async function connect(email?: string, password?: string, liAt?: string): Promise<void> {
+  if (SERVERLESS) return connectServerless(email, password, liAt);
+  if (REMOTE) return connectRemote(email, password);
+  return connectLocal(email, password);
 }
 
 /**
- * Connect to LinkedIn. If a saved session exists in the persistent profile,
- * credentials are not needed at all. If LinkedIn throws a 2FA/verification
- * checkpoint, status becomes "checkpoint" and the user finishes it in the
- * visible Chrome window; we poll until the feed is reachable.
+ * Serverless login. Must complete inside one invocation, so we log in and grab
+ * the auth cookie right here — there's no browser left afterwards to finish in.
+ * If LinkedIn throws a CAPTCHA or 2FA we cannot hand the user a window to solve
+ * it in, so we say so plainly rather than hanging.
  */
-export async function connect(email?: string, password?: string): Promise<void> {
+async function connectServerless(email?: string, password?: string, liAt?: string): Promise<void> {
+  // Preferred path in the cloud: adopt an existing LinkedIn session cookie.
+  // Skips the login form entirely, so there's no CAPTCHA to solve in a browser
+  // the user can't see — and their password never leaves their machine.
+  if (liAt?.trim()) {
+    await sl.adoptCookie(liAt);
+    const e = await sl.openEphemeral("https://www.linkedin.com/feed/");
+    g.__jarvisEphemeral = e;
+    if (isLoggedInUrl(e.page.url())) return;
+    await finishRequest();
+    await sl.clearSession();
+    throw new Error("That li_at cookie didn't work — it may be expired. Copy a fresh one.");
+  }
+
+  if (await sl.hasSession()) {
+    const e = await sl.openEphemeral("https://www.linkedin.com/feed/");
+    g.__jarvisEphemeral = e;
+    if (isLoggedInUrl(e.page.url())) return;
+    await finishRequest();
+    await sl.clearSession(); // cookie was stale
+  }
+
+  if (!email || !password) {
+    throw new Error("Enter your LinkedIn email and password to connect.");
+  }
+
+  const e = await sl.openEphemeral("https://www.linkedin.com/login");
+  g.__jarvisEphemeral = e;
+  const page = e.page;
+
+  await page.waitForTimeout(1200);
+  const user = page.locator("#username, input[name='session_key']").first();
+  const pass = page.locator("#password, input[name='session_password']").first();
+  if (await user.isVisible().catch(() => false)) await user.fill(email).catch(() => {});
+  if (!(await pass.isVisible().catch(() => false))) {
+    throw new Error("LinkedIn didn't show a login form. Try again in a moment.");
+  }
+  await pass.fill(password);
+  await page.locator('button[type="submit"]').first().click({ timeout: 8000 }).catch(() => {});
+
+  // wait for the feed, a challenge, or an error — up to ~30s, well inside the limit
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const url = page.url();
+    if (isLoggedInUrl(url)) return; // finishRequest() persists li_at
+    if (isCheckpointUrl(url)) {
+      throw new Error(
+        "LinkedIn is asking for a security check (CAPTCHA or a code). A serverless browser has no window for you to solve it in — run Jarvis locally to complete this challenge once, or set BROWSERBASE_API_KEY to get an interactive live view."
+      );
+    }
+    const err = await page
+      .locator("#error-for-password, #error-for-username, .form__label--error")
+      .first()
+      .textContent()
+      .catch(() => null);
+    if (err?.trim()) throw new Error(err.trim());
+    await page.waitForTimeout(1500);
+  }
+  throw new Error("Timed out logging in to LinkedIn.");
+}
+
+/**
+ * Remote connect must FINISH INSIDE ONE INVOCATION (Vercel kills the function
+ * when the response is sent), so we don't sit and poll for the login here.
+ * We navigate, attempt the credential fill, and return — the client then polls
+ * /status, and the user finishes any 2FA/CAPTCHA in the live view.
+ */
+async function connectRemote(email?: string, password?: string): Promise<void> {
+  const page = await remotePage(true);
+  if (!page) throw new Error("Couldn't start the cloud browser.");
+
+  await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 45000 });
+  await page.waitForTimeout(2500);
+  if (isLoggedInUrl(page.url())) return; // context already had the login
+
+  if (!email || !password) {
+    throw new Error("No saved cloud session — enter your LinkedIn email and password.");
+  }
+
+  if (!page.url().includes("/login")) {
+    await page.goto("https://www.linkedin.com/login", { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(1200);
+  }
+  const user = page.locator("#username, input[name='session_key']").first();
+  const pass = page.locator("#password, input[name='session_password']").first();
+  if (await user.isVisible().catch(() => false)) await user.fill(email).catch(() => {});
+  if (await pass.isVisible().catch(() => false)) {
+    await pass.fill(password);
+    await page.locator('button[type="submit"]').first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(4000);
+  }
+  // whatever state we land in, /status + the live view take it from here
+}
+
+async function connectLocal(email?: string, password?: string): Promise<void> {
   const s = state();
   if (s.status === "connecting") return;
   s.status = "connecting";
   s.error = null;
 
   try {
-    const page = await ensureBrowser();
-    await page.goto("https://www.linkedin.com/feed/", {
-      waitUntil: "domcontentloaded",
-      timeout: 60000,
-    });
+    const page = await localPage();
+    await page.goto("https://www.linkedin.com/feed/", { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(2500);
 
     if (isLoggedInUrl(page.url())) {
       s.status = "connected";
       return;
     }
-
-    // Need a fresh login
     if (!email || !password) {
       s.status = "error";
       s.error =
         "No saved session found — enter your email and password, or just log in directly in the Chrome window (I'll detect it).";
       return;
     }
-
     if (!page.url().includes("/login")) {
-      await page.goto("https://www.linkedin.com/login", {
-        waitUntil: "domcontentloaded",
-        timeout: 60000,
-      });
+      await page.goto("https://www.linkedin.com/login", { waitUntil: "domcontentloaded", timeout: 60000 });
       await page.waitForTimeout(1500);
     }
-
-    // Best effort auto-fill. LinkedIn serves several login variants (classic
-    // form, "Welcome back" remembered account, join-form with different ids),
-    // so a missing field is NOT fatal — the user can always finish the login
-    // in the visible window and the wait loop below will pick it up.
     try {
-      // "Welcome back" screen: click the remembered profile to reveal password
-      const rememberedProfile = page.locator(".member-profile-block, button.member-profile__details").first();
-      if (await rememberedProfile.isVisible().catch(() => false)) {
-        await rememberedProfile.click().catch(() => {});
+      const remembered = page.locator(".member-profile-block, button.member-profile__details").first();
+      if (await remembered.isVisible().catch(() => false)) {
+        await remembered.click().catch(() => {});
         await page.waitForTimeout(1200);
       }
-
-      const userField = page.locator("#username, input[name='session_key']").first();
-      const passField = page.locator("#password, input[name='session_password']").first();
-      if (await userField.isVisible().catch(() => false)) {
-        await userField.fill(email, { timeout: 5000 }).catch(() => {});
-      }
-      if (await passField.isVisible().catch(() => false)) {
-        await passField.fill(password, { timeout: 5000 });
+      const user = page.locator("#username, input[name='session_key']").first();
+      const pass = page.locator("#password, input[name='session_password']").first();
+      if (await user.isVisible().catch(() => false)) await user.fill(email, { timeout: 5000 }).catch(() => {});
+      if (await pass.isVisible().catch(() => false)) {
+        await pass.fill(password, { timeout: 5000 });
         await page.waitForTimeout(400);
         await page
           .locator('button[type="submit"], button[data-litms-control-urn="login-submit"]')
@@ -191,11 +416,9 @@ export async function connect(email?: string, password?: string): Promise<void> 
         await page.waitForTimeout(3000);
       }
     } catch {
-      // auto-fill failed — the user finishes login manually in the window
+      /* user finishes manually in the window */
     }
 
-    // Wait up to 5 minutes for the feed — covers autofill success, manual
-    // login, and checkpoints the user resolves in the window
     const deadline = Date.now() + 300000;
     while (Date.now() < deadline) {
       const url = page.url();
@@ -203,20 +426,7 @@ export async function connect(email?: string, password?: string): Promise<void> 
         s.status = "connected";
         return;
       }
-      if (isCheckpointUrl(url)) {
-        s.status = "checkpoint";
-      } else if (url.includes("/login")) {
-        const err = await page
-          .locator("#error-for-password, #error-for-username, .form__label--error")
-          .first()
-          .textContent()
-          .catch(() => null);
-        if (err && err.trim()) {
-          s.status = "error";
-          s.error = err.trim();
-          return;
-        }
-      }
+      if (isCheckpointUrl(url)) s.status = "checkpoint";
       await page.waitForTimeout(2000);
     }
     s.status = "error";
@@ -228,10 +438,33 @@ export async function connect(email?: string, password?: string): Promise<void> 
 }
 
 export async function disconnect(): Promise<void> {
+  if (SERVERLESS) {
+    await finishRequest();
+    await sl.clearSession();
+    return;
+  }
+  if (REMOTE) {
+    const id = await readCookie(SESSION_COOKIE);
+    if (id) await bb.releaseSession(id);
+    try {
+      (await cookies()).delete(SESSION_COOKIE);
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
   const s = state();
   await s.context?.close().catch(() => {});
   s.context = null;
   s.page = null;
   s.status = "disconnected";
   s.error = null;
+}
+
+export function isRemote(): boolean {
+  return REMOTE;
+}
+
+export function isServerless(): boolean {
+  return SERVERLESS;
 }

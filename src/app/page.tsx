@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { speak, primeVoices, type SpeakHandle } from "@/lib/voice";
+import { speak, primeVoices, warmUpSpeech, type SpeakHandle } from "@/lib/voice";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -31,12 +31,20 @@ interface SpeechRecognitionLike {
   stop(): void;
   abort(): void;
   onresult: ((e: SpeechRecognitionEventLike) => void) | null;
+  onstart: (() => void) | null;
   onend: (() => void) | null;
   onerror: ((e: { error: string }) => void) | null;
 }
 interface SpeechRecognitionEventLike {
   resultIndex: number;
   results: { length: number; [i: number]: { isFinal: boolean; 0: { transcript: string } } };
+}
+
+interface SafetyUsage {
+  actions: { kind: string; label: string; hour: number; perHour: number; day: number; perDay: number }[];
+  totalDay: number;
+  globalDay: number;
+  cooldownSec: number;
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -88,20 +96,33 @@ export default function Home() {
   const [connError, setConnError] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [liAt, setLiAt] = useState(""); // cloud mode: adopt an existing session
+  const [useCookie, setUseCookie] = useState(false);
 
   const [agentState, setAgentState] = useState<AgentState>("idle");
   const [micOn, setMicOn] = useState(false);
+  const [micLive, setMicLive] = useState(false); // is recognition actually running
   const [interim, setInterim] = useState("");
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [textInput, setTextInput] = useState("");
   const [speechSupported, setSpeechSupported] = useState(true);
-  const [neuralVoice, setNeuralVoice] = useState(true);
+  // Default OFF: neural TTS is a network round trip (1-3s per reply). The system
+  // voice speaks instantly. Flip it on when you have TTS quota and want realism
+  // more than speed.
+  const [neuralVoice, setNeuralVoice] = useState(false);
   // Web Speech recognition needs an explicit locale — it can't auto-detect.
   const [lang, setLang] = useState<"en-US" | "ur-PK">("en-US");
   const [theme, setTheme] = useState<"dark" | "light">("dark");
+  // Cloud mode: the browser runs in Browserbase, so we embed its live view —
+  // that's how the user solves CAPTCHAs and watches Jarvis work when deployed.
+  const [safety, setSafety] = useState<SafetyUsage | null>(null);
+  const [remote, setRemote] = useState(false);
+  const [liveView, setLiveView] = useState<string | null>(null);
+  const [showLiveView, setShowLiveView] = useState(false);
 
   const recRef = useRef<SpeechRecognitionLike | null>(null);
+  const recLiveRef = useRef(false); // is a recognizer actually running right now?
   const micOnRef = useRef(false);
   const messagesRef = useRef<ChatMsg[]>([]);
   const feedEndRef = useRef<HTMLDivElement>(null);
@@ -156,8 +177,15 @@ export default function Home() {
       if (j.status === "connected") everConnectedRef.current = true;
       setConn(j.status);
       setConnError(j.error ?? null);
+      setRemote(!!j.remote);
+      setLiveView(j.liveViewUrl ?? null);
     } catch {
       setConn("unknown");
+    }
+    try {
+      setSafety(await (await fetch("/api/safety")).json());
+    } catch {
+      /* non-critical */
     }
   }, []);
 
@@ -174,7 +202,7 @@ export default function Home() {
     await fetch("/api/linkedin/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password, liAt }),
     });
     refreshStatus();
   };
@@ -311,7 +339,27 @@ export default function Home() {
       setSpeechSupported(false);
       return;
     }
-    recRef.current?.abort();
+
+    // Retire the previous recognizer FIRST — detach its handlers and clear the
+    // ref before aborting. abort() fires onend asynchronously, so if the ref
+    // still pointed at the old recognizer its restart guard would pass and it
+    // would revive itself alongside the new one. Two live recognizers make
+    // Chrome error out and kill both — that's what stopped the mic after a
+    // couple of commands.
+    const prev = recRef.current;
+    recRef.current = null;
+    recLiveRef.current = false;
+    if (prev) {
+      prev.onresult = null;
+      prev.onstart = null;
+      prev.onend = null;
+      prev.onerror = null;
+      try {
+        prev.abort();
+      } catch {
+        /* already dead */
+      }
+    }
 
     const rec = new Ctor();
     rec.lang = langRef.current;
@@ -327,54 +375,101 @@ export default function Home() {
         else interimText += r[0].transcript;
       }
       if (interimText) setInterim(interimText);
-      const spoken = finalText.trim();
-      if (!spoken || NOISE.test(spoken)) return;
 
-      // Echo guard: while Jarvis is talking, the mic can hear her own voice.
-      // Drop transcripts that are just a fragment of what she's saying.
-      const echo = spokenTextRef.current;
-      if (echo && spoken.length > 3) {
-        const words = spoken.toLowerCase().split(/\s+/);
+      // Echo guard: while Jarvis talks, the mic hears her own voice. Ignore
+      // transcripts that are mostly words she is currently saying.
+      const isEcho = (t: string) => {
+        const echo = spokenTextRef.current;
+        if (!echo || t.length <= 3) return false;
+        const words = t.toLowerCase().split(/\s+/);
         const overlap = words.filter((w2) => w2.length > 3 && echo.includes(w2)).length;
-        if (overlap >= Math.max(2, Math.ceil(words.length * 0.6))) return;
+        return overlap >= Math.max(2, Math.ceil(words.length * 0.6));
+      };
+
+      // DUCK IMMEDIATELY: the moment real speech is heard — on the interim
+      // result, long before the final transcript lands — cut Jarvis off. Waiting
+      // for the final transcript made her talk over the user for a second or more.
+      const heard = interimText.trim();
+      if (heard && heard.length > 1 && !NOISE.test(heard) && !isEcho(heard)) {
+        if (speakRef.current) {
+          speakRef.current.stop();
+          speakRef.current = null;
+          spokenTextRef.current = "";
+          setAgentState("listening");
+        }
       }
 
-      // Recognition keeps running — this IS the barge-in.
+      const spoken = finalText.trim();
+      if (!spoken || NOISE.test(spoken) || isEcho(spoken)) return;
+
+      // Recognition never stopped — this IS the barge-in.
       sendCommand(spoken);
     };
 
+    // Trust the browser's own events for liveness rather than assuming start()
+    // worked — a start() that throws or silently no-ops was leaving the mic dead.
+    rec.onstart = () => {
+      recLiveRef.current = true;
+    };
     rec.onend = () => {
-      // Chrome cuts recognition on silence; restart as long as the mic is on.
+      recLiveRef.current = false;
+      // Chrome ends recognition constantly — on silence, on network blips, after
+      // ~60s. Only the CURRENT recognizer may revive itself; a retired one stays dead.
       if (micOnRef.current && recRef.current === rec) {
         try {
           rec.start();
         } catch {
-          /* already running */
+          /* watchdog rebuilds it */
         }
       }
     };
     rec.onerror = (e) => {
-      if (e.error === "not-allowed") {
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
         setSpeechSupported(false);
         setMicOn(false);
         setAgentState("idle");
+        return;
       }
+      // "no-speech", "aborted", "network" are routine — onend/watchdog recover.
     };
 
     recRef.current = rec;
     try {
-      rec.start();
+      rec.start(); // onstart flips recLiveRef; a throw leaves it false for the watchdog
     } catch {
-      /* ignore double-start */
+      recLiveRef.current = false;
     }
   }, [sendCommand]);
+
+  // Watchdog: if the mic is meant to be on but recognition has died and failed
+  // to revive itself, rebuild it. This is the safety net that guarantees Jarvis
+  // never silently stops listening mid-session.
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (micOnRef.current && !recLiveRef.current) startRecognition();
+      setMicLive(recLiveRef.current); // drives the green/amber dot
+    }, 1500);
+    return () => clearInterval(t);
+  }, [startRecognition]);
 
   const toggleMic = () => {
     if (micOn) {
       setMicOn(false);
-      micOnRef.current = false;
-      recRef.current?.abort();
+      micOnRef.current = false; // set before abort so onend won't revive it
+      const rec = recRef.current;
       recRef.current = null;
+      recLiveRef.current = false;
+      if (rec) {
+        rec.onresult = null;
+        rec.onstart = null;
+        rec.onend = null;
+        rec.onerror = null;
+        try {
+          rec.abort();
+        } catch {
+          /* already stopped */
+        }
+      }
       interrupt();
       setInterim("");
       setAgentState("idle");
@@ -382,6 +477,7 @@ export default function Home() {
       setMicOn(true);
       micOnRef.current = true;
       setAgentState("listening");
+      warmUpSpeech(); // this click is a user gesture — boot the TTS engine now
       startRecognition();
     }
   };
@@ -424,6 +520,15 @@ export default function Home() {
           </div>
         </div>
         <div className="flex items-center gap-3">
+          {remote && showDashboard && (
+            <button
+              onClick={() => setShowLiveView((v) => !v)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-[11px] text-zinc-400 transition hover:border-zinc-500 hover:text-zinc-200 light:border-zinc-300 light:text-zinc-600"
+              title="Watch the cloud browser Jarvis is driving"
+            >
+              {showLiveView ? "Hide browser" : "Show browser"}
+            </button>
+          )}
           <button
             onClick={toggleTheme}
             className="rounded-full border border-zinc-700 px-3 py-1 text-[11px] text-zinc-400 transition hover:border-zinc-500 hover:text-zinc-200 light:border-zinc-300 light:text-zinc-600 light:hover:border-zinc-400 light:hover:text-zinc-900"
@@ -449,9 +554,9 @@ export default function Home() {
             <button
               onClick={() => setNeuralVoice((v) => !v)}
               className="rounded-full border border-zinc-700 px-3 py-1 text-[11px] text-zinc-400 transition hover:border-zinc-500 hover:text-zinc-200 light:border-zinc-300 light:text-zinc-600 light:hover:border-zinc-400 light:hover:text-zinc-900"
-              title="Neural voice sounds human but takes a moment; system voice is instant."
+              title="System voice is instant. Neural sounds human but adds 1-3s per reply and needs TTS quota."
             >
-              Voice: {neuralVoice ? "Neural" : "System"}
+              Voice: {neuralVoice ? "Neural (slower)" : "Instant"}
             </button>
           )}
           <span className={`rounded-full border px-3 py-1 text-[11px] font-medium ${connPill.cls}`}>
@@ -470,8 +575,34 @@ export default function Home() {
 
       {conn === "checkpoint" && (
         <div className="fade-in mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-[13px] text-amber-200">
-          <strong className="font-semibold">LinkedIn security check.</strong> Solve the CAPTCHA or
-          verification in the open Chrome window, then carry on here — I&apos;ll pick it up automatically.
+          <strong className="font-semibold">LinkedIn security check.</strong>{" "}
+          {remote
+            ? "Solve it in the live browser below — it's interactive."
+            : "Solve the CAPTCHA in the open Chrome window."}{" "}
+          I&apos;ll pick it up automatically.
+        </div>
+      )}
+
+      {/* Cloud mode: the browser isn't on this machine, so show it here. */}
+      {remote && liveView && (conn === "checkpoint" || conn === "connecting" || showLiveView) && (
+        <div className="fade-in mb-4 overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900/60 light:border-zinc-200 light:bg-white/70">
+          <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2 light:border-zinc-200">
+            <span className="text-[12px] font-medium text-zinc-300 light:text-zinc-700">
+              Live browser — you can click and type in it
+            </span>
+            <button
+              onClick={() => setShowLiveView(false)}
+              className="text-[11px] text-zinc-500 hover:text-zinc-300"
+            >
+              Hide
+            </button>
+          </div>
+          <iframe
+            src={liveView}
+            className="h-[560px] w-full"
+            sandbox="allow-same-origin allow-scripts allow-forms"
+            allow="clipboard-read; clipboard-write"
+          />
         </div>
       )}
 
@@ -484,21 +615,48 @@ export default function Home() {
               session is saved locally, so next time you won&apos;t need them at all.
             </p>
             <div className="mt-6 space-y-3">
-              <input
-                type="email"
-                placeholder="LinkedIn email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className="w-full rounded-xl border border-zinc-700 bg-zinc-950/70 px-4 py-3 text-sm text-white placeholder-zinc-600 outline-none transition focus:border-indigo-500 light:border-zinc-300 light:bg-white light:text-zinc-900 light:placeholder-zinc-400"
-              />
-              <input
-                type="password"
-                placeholder="Password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleConnect()}
-                className="w-full rounded-xl border border-zinc-700 bg-zinc-950/70 px-4 py-3 text-sm text-white placeholder-zinc-600 outline-none transition focus:border-indigo-500 light:border-zinc-300 light:bg-white light:text-zinc-900 light:placeholder-zinc-400"
-              />
+              {useCookie ? (
+                <>
+                  <textarea
+                    placeholder="Paste your li_at cookie value"
+                    value={liAt}
+                    onChange={(e) => setLiAt(e.target.value)}
+                    rows={3}
+                    className="w-full resize-none rounded-xl border border-zinc-700 bg-zinc-950/70 px-4 py-3 font-mono text-[11px] text-white placeholder-zinc-600 outline-none transition focus:border-indigo-500 light:border-zinc-300 light:bg-white light:text-zinc-900 light:placeholder-zinc-400"
+                  />
+                  <p className="text-[11px] leading-relaxed text-zinc-500 light:text-zinc-500">
+                    In a browser where you&apos;re already on LinkedIn: DevTools → Application →
+                    Cookies → <code>linkedin.com</code> → copy the value of <code>li_at</code>. Your
+                    password never leaves your machine, and no CAPTCHA is involved.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <input
+                    type="email"
+                    placeholder="LinkedIn email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="w-full rounded-xl border border-zinc-700 bg-zinc-950/70 px-4 py-3 text-sm text-white placeholder-zinc-600 outline-none transition focus:border-indigo-500 light:border-zinc-300 light:bg-white light:text-zinc-900 light:placeholder-zinc-400"
+                  />
+                  <input
+                    type="password"
+                    placeholder="Password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleConnect()}
+                    className="w-full rounded-xl border border-zinc-700 bg-zinc-950/70 px-4 py-3 text-sm text-white placeholder-zinc-600 outline-none transition focus:border-indigo-500 light:border-zinc-300 light:bg-white light:text-zinc-900 light:placeholder-zinc-400"
+                  />
+                </>
+              )}
+              <button
+                onClick={() => setUseCookie((v) => !v)}
+                className="w-full text-center text-[11px] text-indigo-400 hover:text-indigo-300"
+              >
+                {useCookie
+                  ? "← Use email and password instead"
+                  : "Deployed to the cloud? Sign in with your li_at cookie instead →"}
+              </button>
               <button
                 onClick={handleConnect}
                 disabled={conn === "connecting"}
@@ -527,7 +685,15 @@ export default function Home() {
               </div>
               <div className="orb-gloss" />
             </div>
-            <p className="mt-8 text-sm font-medium text-zinc-300 light:text-zinc-700">{stateLabel[agentState]}</p>
+            <div className="mt-8 flex items-center gap-2">
+              {micOn && (
+                <span
+                  className={`h-2 w-2 rounded-full ${micLive ? "animate-pulse bg-emerald-400" : "bg-amber-400"}`}
+                  title={micLive ? "Microphone is live" : "Reconnecting microphone…"}
+                />
+              )}
+              <p className="text-sm font-medium text-zinc-300 light:text-zinc-700">{stateLabel[agentState]}</p>
+            </div>
             <p className="mt-1 min-h-[22px] max-w-md text-center text-[13px] italic text-zinc-500 light:text-zinc-500">
               {interim ||
                 (agentState === "listening"
@@ -591,8 +757,44 @@ export default function Home() {
 
           <aside className="flex max-h-[calc(100vh-140px)] flex-col rounded-2xl border border-zinc-800/80 bg-zinc-900/40 backdrop-blur light:border-zinc-200 light:bg-white/70">
             <div className="border-b border-zinc-800 px-5 py-4 light:border-zinc-200">
-              <h3 className="text-sm font-semibold text-white light:text-zinc-900">Activity</h3>
+              <div className="flex items-baseline justify-between">
+                <h3 className="text-sm font-semibold text-white light:text-zinc-900">Activity</h3>
+                {safety && (
+                  <span
+                    className="text-[10px] text-zinc-500"
+                    title="Writes today, against the safety ceiling that protects your account"
+                  >
+                    {safety.totalDay}/{safety.globalDay} actions today
+                  </span>
+                )}
+              </div>
               <p className="text-[11px] text-zinc-500 light:text-zinc-500">everything Jarvis does, live</p>
+              {safety && safety.cooldownSec > 0 && (
+                <p className="mt-1 text-[11px] text-amber-400">
+                  Pacing cool-down: {safety.cooldownSec}s (keeps LinkedIn from seeing a burst)
+                </p>
+              )}
+              {safety && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {safety.actions
+                    .filter((a) => a.day > 0)
+                    .map((a) => (
+                      <span
+                        key={a.kind}
+                        className={`rounded-full border px-2 py-0.5 text-[10px] ${
+                          a.day >= a.perDay
+                            ? "border-rose-500/30 bg-rose-500/10 text-rose-300"
+                            : a.day >= a.perDay * 0.7
+                              ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                              : "border-zinc-700 text-zinc-500"
+                        }`}
+                        title={`${a.hour}/${a.perHour} this hour`}
+                      >
+                        {a.label} {a.day}/{a.perDay}
+                      </span>
+                    ))}
+                </div>
+              )}
             </div>
             <div className="panel-scroll flex-1 space-y-2 overflow-y-auto p-4">
               {feed.length === 0 && (
