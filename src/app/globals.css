@@ -1,0 +1,234 @@
+@import "tailwindcss";
+
+/* Light theme is opt-in via data-theme="light" on <html>; dark is the default. */
+@custom-variant light (&:where([data-theme="light"], [data-theme="light"] *));
+
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+::selection {
+  background: rgba(139, 92, 246, 0.35);
+}
+
+/* ------------------------------------------------------------------ */
+/* Voice orb                                                           */
+/*                                                                     */
+/* Three stacked layers rotate at different speeds around their own    */
+/* axis, and a hue-rotate filter cycles the colour continuously. The   */
+/* offset gradients mean the spin is actually visible — a perfectly    */
+/* radial sphere would look static however fast it turned.             */
+/* ------------------------------------------------------------------ */
+
+.orb {
+  position: relative;
+  width: 190px;
+  height: 190px;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.3s ease;
+}
+.orb:hover {
+  transform: scale(1.04);
+}
+
+/*
+ * The sphere is a clipping mask; the motion you actually SEE comes from
+ * distinct colour blobs orbiting inside it. A smooth conic gradient looks
+ * frozen no matter how fast it spins — offset, high-contrast blobs don't.
+ * A hue-rotate on the whole orb then cycles the palette on top of that.
+ */
+.orb-core {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 50%, #4c1d95 0%, #1e1b4b 70%, #0f0a2e 100%);
+  animation: orb-hue 9s linear infinite, orb-breathe-scale 5s ease-in-out infinite;
+}
+
+/* each blob orbits the centre at its own radius, speed and direction */
+.orb-blob {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 70%;
+  height: 70%;
+  margin: -35% 0 0 -35%;
+  border-radius: 50%;
+  filter: blur(18px);
+  mix-blend-mode: screen;
+  transform-origin: center;
+}
+.orb-blob-1 {
+  background: radial-gradient(circle, #22d3ee 0%, rgba(34, 211, 238, 0) 68%);
+  animation: orb-orbit-a 6s linear infinite;
+}
+.orb-blob-2 {
+  background: radial-gradient(circle, #e879f9 0%, rgba(232, 121, 249, 0) 68%);
+  animation: orb-orbit-b 8s linear infinite;
+}
+.orb-blob-3 {
+  background: radial-gradient(circle, #818cf8 0%, rgba(129, 140, 248, 0) 68%);
+  animation: orb-orbit-c 5s linear infinite;
+}
+
+/* the orbits: rotate → push out → counter-rotate keeps each blob upright */
+@keyframes orb-orbit-a {
+  from { transform: rotate(0deg) translateX(20%) rotate(0deg); }
+  to   { transform: rotate(360deg) translateX(20%) rotate(-360deg); }
+}
+@keyframes orb-orbit-b {
+  from { transform: rotate(120deg) translateX(26%) rotate(0deg); }
+  to   { transform: rotate(-240deg) translateX(26%) rotate(360deg); }
+}
+@keyframes orb-orbit-c {
+  from { transform: rotate(240deg) translateX(16%) rotate(0deg); }
+  to   { transform: rotate(600deg) translateX(16%) rotate(-360deg); }
+}
+
+/* counter-rotating shading band: reads as the sphere physically turning */
+.orb-swirl {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 180deg,
+    transparent 0deg,
+    rgba(255, 255, 255, 0.18) 50deg,
+    transparent 120deg,
+    rgba(0, 0, 0, 0.35) 230deg,
+    transparent 330deg
+  );
+  mix-blend-mode: overlay;
+  animation: orb-spin-reverse 7s linear infinite;
+}
+
+/* specular highlight stays put so the sphere reads as lit from one side */
+.orb-gloss {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 32% 26%, rgba(255, 255, 255, 0.6) 0%, rgba(255, 255, 255, 0.12) 14%, transparent 32%),
+    radial-gradient(circle at 50% 50%, transparent 55%, rgba(0, 0, 0, 0.35) 100%);
+  pointer-events: none;
+}
+
+.orb-glow {
+  position: absolute;
+  inset: -34px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(124, 58, 237, 0.45) 0%, rgba(14, 165, 233, 0.18) 45%, transparent 70%);
+  filter: blur(22px);
+  animation: orb-breathe 4.5s ease-in-out infinite, orb-hue 12s linear infinite;
+}
+
+.orb-ring {
+  position: absolute;
+  inset: -12px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+:root[data-theme="light"] .orb-ring {
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+/* --- states: same sphere, different energy --- */
+
+/* Listening: alert — blobs speed up, ring pulses out. */
+.orb.listening .orb-core {
+  animation: orb-hue 5s linear infinite, orb-breathe-scale 1.8s ease-in-out infinite;
+}
+.orb.listening .orb-blob-1 { animation-duration: 2.6s; }
+.orb.listening .orb-blob-2 { animation-duration: 3.4s; }
+.orb.listening .orb-blob-3 { animation-duration: 2.2s; }
+.orb.listening .orb-swirl { animation-duration: 3s; }
+.orb.listening .orb-glow {
+  animation: orb-breathe 1.6s ease-in-out infinite, orb-hue 5s linear infinite;
+}
+.orb.listening .orb-ring {
+  animation: orb-pulse-ring 1.6s ease-out infinite;
+}
+
+/* Thinking: churning — everything whirls, colours race. */
+.orb.thinking .orb-core {
+  animation: orb-hue 1.8s linear infinite, orb-breathe-scale 1.2s ease-in-out infinite;
+}
+.orb.thinking .orb-blob-1 { animation-duration: 1.1s; }
+.orb.thinking .orb-blob-2 { animation-duration: 1.5s; }
+.orb.thinking .orb-blob-3 { animation-duration: 0.9s; }
+.orb.thinking .orb-swirl { animation-duration: 1s; }
+.orb.thinking .orb-glow {
+  animation: orb-breathe 1.2s ease-in-out infinite, orb-hue 1.8s linear infinite;
+}
+
+/* Speaking: throbbing to the voice. */
+.orb.speaking .orb-core {
+  animation: orb-hue 3s linear infinite, orb-breathe-scale 0.7s ease-in-out infinite;
+}
+.orb.speaking .orb-blob-1 { animation-duration: 3s; }
+.orb.speaking .orb-blob-2 { animation-duration: 4s; }
+.orb.speaking .orb-blob-3 { animation-duration: 2.4s; }
+.orb.speaking .orb-swirl { animation-duration: 4s; }
+.orb.speaking .orb-glow {
+  animation: orb-breathe 0.8s ease-in-out infinite, orb-hue 3s linear infinite;
+}
+
+@keyframes orb-spin-reverse {
+  from { transform: rotate(360deg); }
+  to { transform: rotate(0deg); }
+}
+@keyframes orb-hue {
+  from { filter: hue-rotate(0deg) saturate(1.15); }
+  to { filter: hue-rotate(360deg) saturate(1.15); }
+}
+@keyframes orb-breathe-scale {
+  0%, 100% { scale: 1; }
+  50% { scale: 1.03; }
+}
+@keyframes orb-breathe {
+  0%, 100% { opacity: 0.65; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.09); }
+}
+@keyframes orb-pulse-ring {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(1.35); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb-core,
+  .orb-blob,
+  .orb-swirl,
+  .orb-glow,
+  .orb-ring {
+    animation: none !important;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Misc                                                                */
+/* ------------------------------------------------------------------ */
+
+.fade-in {
+  animation: fade-in 0.35s ease both;
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.panel-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.panel-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+}
+:root[data-theme="light"] .panel-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+}
