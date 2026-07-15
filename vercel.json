@@ -1,9 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "src/app/api/agent/route.ts": { "maxDuration": 60, "memory": 3008 },
-    "src/app/api/tool/route.ts": { "maxDuration": 60, "memory": 3008 },
-    "src/app/api/linkedin/connect/route.ts": { "maxDuration": 60, "memory": 3008 },
-    "src/app/api/linkedin/status/route.ts": { "maxDuration": 30, "memory": 3008 }
+    "src/app/api/agent/route.ts": { "maxDuration": 60, "memory": 2048 },
+    "src/app/api/tool/route.ts": { "maxDuration": 60, "memory": 2048 },
+    "src/app/api/linkedin/connect/route.ts": { "maxDuration": 60, "memory": 2048 },
+    "src/app/api/linkedin/status/route.ts": { "maxDuration": 30, "memory": 2048 }
   }
 }
