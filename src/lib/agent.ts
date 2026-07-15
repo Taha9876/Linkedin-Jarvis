@@ -586,20 +586,22 @@ function getProviders(): Provider[] {
   const groq = process.env.GROQ_API_KEY;
   const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
-  // Groq FIRST: measured ~0.8s vs Gemini's ~1.6s on the same prompt. For a voice
-  // agent that fires several model calls per spoken command, that gap compounds
-  // into the difference between snappy and sluggish. gpt-oss-120b also handles
-  // this many tool definitions reliably (llama-3.3 returns tool_use_failed).
+  // Groq FIRST, and with SEVERAL Groq models before we ever touch Gemini.
+  //   - Groq is faster (~0.8s vs ~1.6s).
+  //   - Critically, Gemini's OpenAI-compat endpoint is BROKEN for multi-turn
+  //     tool calls: the second call (after a tool runs) fails with
+  //     "missing thought_signature", which killed every multi-step command.
+  //     Staying on Groq — one model failing over to the next Groq model on a
+  //     rate limit — avoids Gemini entirely for the normal path.
+  const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
   if (groq) {
-    list.push({
-      url: "https://api.groq.com/openai/v1/chat/completions",
-      key: groq,
-      model: "openai/gpt-oss-120b",
-      name: "Groq",
-    });
+    for (const model of ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]) {
+      list.push({ url: GROQ_URL, key: groq, model, name: `Groq ${model.split("/").pop()}` });
+    }
   }
+  // Gemini is last-resort only. It's fine for a SINGLE-turn reply (no tools),
+  // but must not be relied on mid-tool-loop.
   if (gemini) {
-    list.push({ url: GEMINI_URL, key: gemini, model: "gemini-flash-lite-latest", name: "Gemini Flash-Lite" });
     list.push({ url: GEMINI_URL, key: gemini, model: "gemini-flash-latest", name: "Gemini Flash" });
   }
   return list;
@@ -793,6 +795,10 @@ export async function* runAgent(
     },
   ];
 
+  // Tracks what the tools produced this turn, so a later model failure can be
+  // answered from real results instead of a scary "something went wrong".
+  let lastResults: string[] = [];
+
   for (let turn = 0; turn < 8; turn++) {
     if (cancelled()) {
       yield { type: "assistant", content: "Stopped." };
@@ -807,6 +813,14 @@ export async function* runAgent(
     });
 
     if ("error" in result) {
+      // If tools already ran this turn, the ACTION succeeded — only the model's
+      // closing sentence failed. Speak the tool output rather than erroring, so
+      // a flaky model never makes a completed action look broken.
+      if (lastResults.length) {
+        const summary = lastResults.join(" ").replace(/\s+/g, " ").trim();
+        yield { type: "assistant", content: summary.slice(0, 600) };
+        return;
+      }
       yield { type: "error", content: result.error };
       return;
     }
@@ -821,6 +835,7 @@ export async function* runAgent(
       const spoken: string[] = [];
       let allSpeakable = true;
       let anyFailed = false;
+      lastResults = [];
 
       for (const tc of msg.tool_calls) {
         let args: Record<string, unknown> = {};
@@ -834,6 +849,7 @@ export async function* runAgent(
           const result = await executeTool(tc.function.name, args);
           yield { type: "tool_result", name: tc.function.name, content: result };
           messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+          lastResults.push(result);
           if (SPEAKABLE.has(tc.function.name)) spoken.push(result);
           else allSpeakable = false;
         } catch (e) {
