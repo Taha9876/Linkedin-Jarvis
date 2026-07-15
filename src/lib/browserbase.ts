@@ -17,15 +17,27 @@
 
 const API = "https://api.browserbase.com/v1";
 
-function creds() {
-  const apiKey = process.env.BROWSERBASE_API_KEY;
-  const projectId = process.env.BROWSERBASE_PROJECT_ID;
-  if (!apiKey || !projectId) return null;
-  return { apiKey, projectId };
+export function remoteEnabled(): boolean {
+  return !!process.env.BROWSERBASE_API_KEY;
 }
 
-export function remoteEnabled(): boolean {
-  return creds() !== null;
+function apiKey(): string {
+  const k = process.env.BROWSERBASE_API_KEY;
+  if (!k) throw new Error("Browserbase is not configured.");
+  return k;
+}
+
+// The REST API needs a projectId in the body, but the user only supplies the
+// API key — so we resolve the (single) project from the key once and cache it.
+// This is what lets the whole thing run on one env var.
+let cachedProjectId: string | null = null;
+async function projectId(): Promise<string> {
+  if (cachedProjectId) return cachedProjectId;
+  const projects = await bb("/projects");
+  const first = Array.isArray(projects) ? projects[0] : null;
+  if (!first?.id) throw new Error("No Browserbase project found for this API key.");
+  cachedProjectId = first.id as string;
+  return cachedProjectId;
 }
 
 interface SessionInfo {
@@ -35,12 +47,10 @@ interface SessionInfo {
 }
 
 async function bb(path: string, init: RequestInit = {}) {
-  const c = creds();
-  if (!c) throw new Error("Browserbase is not configured.");
   const res = await fetch(`${API}${path}`, {
     ...init,
     headers: {
-      "X-BB-API-Key": c.apiKey,
+      "X-BB-API-Key": apiKey(),
       "Content-Type": "application/json",
       ...(init.headers ?? {}),
     },
@@ -58,20 +68,18 @@ async function bb(path: string, init: RequestInit = {}) {
  */
 export async function ensureContext(existing?: string): Promise<string> {
   if (existing) return existing;
-  const c = creds()!;
   const ctx = await bb("/contexts", {
     method: "POST",
-    body: JSON.stringify({ projectId: c.projectId }),
+    body: JSON.stringify({ projectId: await projectId() }),
   });
   return ctx.id as string;
 }
 
 export async function createSession(contextId: string): Promise<SessionInfo> {
-  const c = creds()!;
   const s = await bb("/sessions", {
     method: "POST",
     body: JSON.stringify({
-      projectId: c.projectId,
+      projectId: await projectId(),
       // survive between serverless invocations instead of dying with the function
       keepAlive: true,
       browserSettings: {
@@ -105,9 +113,8 @@ export async function liveViewUrl(id: string): Promise<string | null> {
 }
 
 export async function releaseSession(id: string): Promise<void> {
-  const c = creds()!;
   await bb(`/sessions/${id}`, {
     method: "POST",
-    body: JSON.stringify({ projectId: c.projectId, status: "REQUEST_RELEASE" }),
+    body: JSON.stringify({ projectId: await projectId(), status: "REQUEST_RELEASE" }),
   }).catch(() => {});
 }
