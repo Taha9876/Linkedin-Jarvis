@@ -121,9 +121,20 @@ export async function openEphemeral(startUrl?: string): Promise<Ephemeral> {
   const mod = await import("@sparticuz/chromium");
   const pack = mod.default ?? mod;
 
+  // Vercel's build strips the compressed Chromium binary out of node_modules
+  // ("/var/task/.../@sparticuz/chromium/bin does not exist"). Instead of fighting
+  // the bundler, we download the version-matched binary from the package's own
+  // GitHub release at runtime — executablePath(URL) fetches and caches it in
+  // /tmp. CHROMIUM_PACK_URL can override this if the default asset name changes.
+  const PACK_URL =
+    process.env.CHROMIUM_PACK_URL ||
+    "https://github.com/Sparticuz/chromium/releases/download/v149.0.0/chromium-v149.0.0-pack.x64.tar";
+
+  const executablePath = await pack.executablePath(PACK_URL);
+
   const browser = await chromium.launch({
     args: [...pack.args, "--disable-blink-features=AutomationControlled"],
-    executablePath: await pack.executablePath(),
+    executablePath,
     headless: true,
   });
 
